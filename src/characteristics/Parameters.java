@@ -21,7 +21,7 @@ public class Parameters {
   //-----------------------//
   //---TEAM-A-PARAMETERS---//
   //-----------------------//
-  public static final String teamAName = "Smart Hunters";
+  public static final String teamAName = "Aegis Legion";
   public static final String teamAMainBotBrainClassName = "algorithms.AegisMain"; //class given by name; is supposed to extends robotsimulator.Brain
   public static final String teamAMainBotAvatar = "avatars/cyclope.png"; //path relative to location of ant build.xml file
   public static final double teamAMainBotRadius = 50, //1 unit = 1mm, body radius
