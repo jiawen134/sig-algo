@@ -10,7 +10,6 @@ public class AegisMain extends Brain {
 
   // ===== 常量 =====
   private static final double TWO_PI = Math.PI * 2.0;
-  private static final double JITTER = 0.02 * Math.PI;          // 开火轻微抖动，减少被边缘挡住
   private static final int    LOCAL_RELOAD = Parameters.bulletFiringLatency; // ~20
   private static final int    POS_PERIOD   = 25;                // 广播自身坐标周期（也便于队友清线）
   private static final int    TXY_LIMIT    = 8;                 // 每扇区TXY限频
@@ -92,11 +91,11 @@ public class AegisMain extends Brain {
     if (tgt != null) {
       // 走廊锁有效：直接开火
       if (reload==0 && fireLockValid(tgt.aim, tgt.dist)) {
-        fire(withJitter(tgt.aim)); reload=LOCAL_RELOAD; lockTick=tick; return;
+        fire(tgt.aim); reload=LOCAL_RELOAD; lockTick=tick; return;
       }
       // 几何清线（友军/尸体）通过 → 开火并上锁
       if (reload==0 && clearByGeometry(tgt.aim, tgt.dist, tgt.rad)) {
-        fire(withJitter(tgt.aim)); reload=LOCAL_RELOAD; armLock(tgt.aim, tgt.dist); return;
+        fire(tgt.aim); reload=LOCAL_RELOAD; armLock(tgt.aim, tgt.dist); return;
       }
       // 被挡：不移动，等走廊变干净（专注射击）
       return;
@@ -255,6 +254,5 @@ public class AegisMain extends Brain {
   private int sectorIndex(double a){ double x=normalize(a); int k=(int)Math.floor(x/TWO_PI*SECT); if(k<0)k=0; if(k>=SECT)k=SECT-1; return k; }
   private static double normalize(double a){ a%=TWO_PI; if (a<0) a+=TWO_PI; return a; }
   private static double signedDiff(double from,double to){ double d=normalize(to-from); if(d>Math.PI)d-=TWO_PI; if(d<=-Math.PI)d+=TWO_PI; return d; }
-  private static double withJitter(double a){ return normalize(a + (Math.random()-0.5)*JITTER*2.0); }
   private static double hypot(double x,double y){ return Math.sqrt(x*x + y*y); }
 }
