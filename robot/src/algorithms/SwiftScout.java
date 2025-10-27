@@ -8,252 +8,164 @@ import characteristics.IRadarResult;
 
 public class SwiftScout extends Brain {
 
-  // =============== 常量与参数 ===============
   private static final double TWO_PI = Math.PI * 2.0;
+  private static final int    POS_PERIOD = 25;
+  private static final int    TXY_LIMIT  = 8;
+  private static final int    TTL_MSG    = 80;
+  private static final int    SECT       = 64;
 
-  private static final double TURN_HARD = 0.30;                 // 小些，更灵活(≈17°)
-  private static final double JITTER    = 0.03*Math.PI;
-  private static final int    LOCAL_RELOAD = Math.max(8, Parameters.bulletFiringLatency-2); // 略快尝试
-  private static final int    LOST_TIMEOUT = 40;
+  private static final double STEP         = Parameters.teamASecondaryBotSpeed; // 3
+  private static final double BULLET_RANGE = Parameters.bulletRange;            // 1000
+  private static final double DANGER_WIDTH = 90.0;                              // 主机射线廊道半宽
 
-  private static final int    SECT = 64;
-  private static final int    TTL_MSG = 60;
-  private static final int    TTL_CORPSE = 60;
-  private static final double EPS_TEAM  = 0.20;
-  private static final double EPS_WRECK = 0.12;
+  private int tick=0, lastPosBroadcast=-9999;
+  private final String myId = "A_SCOUT_" + Integer.toHexString((int)(Math.random()*0xFFFF));
+  private final int[] lastTxyBroadcast = new int[SECT];
+  private boolean orbitRight=true;
 
-  // 自身物理（Team A 副机）
-  private static final double MY_RANGE = Parameters.teamASecondaryBotFrontalDetectionRange; // 500
-  private static final double MY_R     = Parameters.teamASecondaryBotRadius;                // 50
-  private static final double VB       = Parameters.bulletVelocity;                         // 10
+  // 里程计
+  private double posX, posY, odoPend=0.0, odoHdg=0.0;
 
-  // 外扩弧线：三拍节奏 2走1转
-  private int beat = 0;
-  private boolean orbitRight = true;
-  private boolean avoidFlip = true;
+  private static class AllyPos { double x,y,hdg; int last; String id; }
+  private static class EnemyXY { double x,y,rad; int last; }
+  private final Map<String, AllyPos> ally = new HashMap<>();
+  private final List<EnemyXY> enemyXY = new ArrayList<>();
 
-  // 运行态
-  private int tick=0, reload=0, lastFireTick=-9999, lostTicks=LOST_TIMEOUT+1;
-  private double prevDirAbs = Double.NaN, angVel=0.0;
-
-  // 协同
-  private final int[] lastBroadcastForSector = new int[SECT];
-  private final SharedTarget[] shared = new SharedTarget[SECT];
-  private final int[] corpseBanUntil = new int[SECT];
-  private final String myId = "A_SCOUT";
-
-  private static class SharedTarget {
-    double dir, dist, rad; int lastSeen, sources; double trust;
-  }
+  private int evadeTicks=0; private double evadeAngle=0;
 
   @Override
   public void activate() {
-    tick=0; reload=0; lastFireTick=-9999; lostTicks=LOST_TIMEOUT+1;
-    prevDirAbs=Double.NaN; angVel=0.0; beat=0; orbitRight=true; avoidFlip=true;
-    Arrays.fill(lastBroadcastForSector, -9999);
-    Arrays.fill(corpseBanUntil, 0);
-    for (int i=0;i<SECT;i++) shared[i]=null;
-    sendLogMessage("SwiftScout: online (distance-aware).");
+    tick=0; Arrays.fill(lastTxyBroadcast, -9999); orbitRight=true;
+    posX = Parameters.teamASecondaryBot1InitX;
+    posY = Parameters.teamASecondaryBot1InitY;
+    odoPend=0.0; odoHdg=getHeading();
+    sendLogMessage("SwiftScout: scout + TXY broadcast + avoid main firing corridors.");
   }
 
   @Override
   public void step() {
-    tick++; if (reload>0) reload--;
+    tick++;
+    applyOdo();
+
+    // 周期广播自身坐标（供主机清线）
+    if (tick - lastPosBroadcast >= POS_PERIOD){
+      lastPosBroadcast=tick;
+      String msg = String.format(java.util.Locale.ROOT, "POS|%s|%d|%.1f|%.1f|%.6f", myId, tick, posX, posY, getHeading());
+      broadcast(msg);
+    }
 
     processMessages();
-    IFrontSensorResult.Types frontT = frontType();
-    ArrayList<IRadarResult> radar = detectRadar();
 
-    // 副机：最近优先（灵活骚扰）
-    IRadarResult local = pickNearestOpponent(radar);
-    if (local!=null){
-      double cur = normalize(local.getObjectDirection());
-      if (!Double.isNaN(prevDirAbs)){
-        double d = signedDiff(prevDirAbs, cur);
-        angVel = 0.6*angVel + 0.4*d;
-      }
-      prevDirAbs = cur; lostTicks=0;
-      tryBroadcast(local);
-    } else {
-      lostTicks++;
-    }
-
-    SharedTarget sharedBest = (local==null) ? selectBestShared() : null;
-
-    // 1) 避障：仅墙/友军 → 交替 退/转
-    if (frontIsWallOrTeam(frontT)) {
-      if (avoidFlip) moveBack(); else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      avoidFlip=!avoidFlip;
-      return;
-    }
-
-    // 2) 射击窗口（冷却好 + 本地看到 + 清线）
-    if (reload==0 && local!=null){
-      double aim = normalize(local.getObjectDirection());
-      double d   = local.getObjectDistance();
-      double r   = local.getObjectRadius();
-
-      double dTheta = Math.atan2(angVel * d, VB);
-      dTheta = clamp(dTheta, -0.35, +0.35);
-      double lead = normalize(aim + dTheta);
-
-      if (d < MY_R + r + 30) { moveBack(); return; }
-
-      if (clearToFire(lead, d, r, radar, frontT)){
-        fire(lead); reload=LOCAL_RELOAD; lastFireTick=tick; return;
-      } else {
-        // 给出炮位：绕侧一步
-        stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-        return;
+    // 雷达→发现敌人就广播世界坐标
+    ArrayList<IRadarResult> rs = detectRadar();
+    if (rs!=null) for (IRadarResult r: rs){
+      if (r.getObjectType()==IRadarResult.Types.OpponentMainBot ||
+          r.getObjectType()==IRadarResult.Types.OpponentSecondaryBot){
+        tryBroadcastTXY(r.getObjectDirection(), r.getObjectDistance(), r.getObjectRadius());
       }
     }
 
-    // 3) 有本地目标：小角差推进，2走1转外扩
-    if (local!=null){
-      double aim = normalize(local.getObjectDirection());
-      double diff = signedDiff(getHeading(), aim);
-      if (Math.abs(diff) > TURN_HARD){
-        stepTurn(diff>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
-        return;
-      }
-      beat = (beat+1)%3;
-      if (beat<2) move(); else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      // 偶发翻向，避免局部小圈
-      if (tick%180==0 || lostTicks>LOST_TIMEOUT/2) orbitRight=!orbitRight;
-      return;
+    // 若处于任一主机→敌机射线廊道 → 横向脱离
+    FireCorridor fc = inAnyMainFireCorridor(posX, posY);
+    if (fc != null) {
+      evadeAngle = Math.atan2(fc.uy, fc.ux) + (fc.side>0 ? +Math.PI/2 : -Math.PI/2);
+      evadeTicks = 14;
+    }
+    if (evadeTicks > 0) {
+      double diff = signedDiff(getHeading(), evadeAngle);
+      if (Math.abs(diff) > 0.25) stepTurn(diff>0?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+      else odoMove();
+      evadeTicks--; return;
     }
 
-    // 4) 只有共享目标：先对准再推进（不开火，直到本地看到）
-    if (sharedBest!=null){
-      double aim = normalize(sharedBest.dir);
-      double diff = signedDiff(getHeading(), aim);
-      if (Math.abs(diff) > TURN_HARD){
-        stepTurn(diff>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
-        return;
-      }
-      beat = (beat+1)%3;
-      if (beat<2) move(); else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      return;
+    // 预测下一步是否会进入主机射线；会则先转再走
+    double nx = posX + Math.cos(getHeading())*STEP;
+    double ny = posY + Math.sin(getHeading())*STEP;
+    if (willEnterAnyMainCorridor(nx, ny)) {
+      stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+      if (tick%120==0) orbitRight=!orbitRight; return;
     }
 
-    // 5) 无目标：扫场(2走1转)
-    beat = (beat+1)%3;
-    if (beat<2) move(); else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+    // 简单避障
+    IFrontSensorResult.Types ft = frontType();
+    if (frontIsBlock(ft)) { stepTurn(Parameters.Direction.RIGHT); return; }
+
+    // 2走1转扫场（覆盖全场）
+    if ((tick%3)!=0) odoMove();
+    else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
   }
 
-  // =================== 传感/工具 ===================
-  private IFrontSensorResult.Types frontType(){
-    try { IFrontSensorResult r = detectFront(); return (r==null)? null : r.getObjectType(); }
-    catch(Throwable t){ return null; }
-  }
-  private static boolean frontIsWallOrTeam(IFrontSensorResult.Types t){
-    if (t==null) return false;
-    return t==IFrontSensorResult.Types.WALL
-        || t==IFrontSensorResult.Types.TeamMainBot
-        || t==IFrontSensorResult.Types.TeamSecondaryBot;
-  }
-  private static boolean isOpponent(IRadarResult.Types t){
-    return t==IRadarResult.Types.OpponentMainBot || t==IRadarResult.Types.OpponentSecondaryBot;
-  }
-  private IRadarResult pickNearestOpponent(ArrayList<IRadarResult> list){
-    if (list==null || list.isEmpty()) return null;
-    IRadarResult best=null; double bestD=1e18;
-    for (IRadarResult r: list){
-      if (!isOpponent(r.getObjectType())) continue;
-      double d = r.getObjectDistance();
-      if (d < bestD){ bestD=d; best=r; }
-    }
-    return best;
-  }
-
-  private boolean clearToFire(double aimAbs, double dTarget, double rTarget,
-                              ArrayList<IRadarResult> radar, IFrontSensorResult.Types frontT)
-  {
-    if (frontIsWallOrTeam(frontT)) return false;
-    if (isCorpseSector(aimAbs)) return false;
-
-    for (IRadarResult r: radar) {
-      if (r.getObjectType()==IRadarResult.Types.TeamMainBot || r.getObjectType()==IRadarResult.Types.TeamSecondaryBot){
-        double da = Math.abs(signedDiff(aimAbs, normalize(r.getObjectDirection())));
-        if (da < EPS_TEAM && r.getObjectDistance() < dTarget + rTarget) return false;
+  // ===== 主机射线判定 =====
+  private static class FireCorridor { double ux,uy; int side; }
+  private FireCorridor inAnyMainFireCorridor(double x,double y){
+    for (Map.Entry<String, AllyPos> en : ally.entrySet()){
+      String id=en.getKey(); if (id==null || !id.startsWith("A_MAIN")) continue;
+      AllyPos m=en.getValue(); if (tick - m.last > TTL_MSG) continue;
+      for (EnemyXY e : enemyXY){
+        if (tick - e.last > TTL_MSG) continue;
+        double distME = Math.hypot(e.x - m.x, e.y - m.y);
+        if (distME > BULLET_RANGE || distME < 1e-6) continue;
+        double ux=(e.x-m.x)/distME, uy=(e.y-m.y)/distME;
+        double vx=x-m.x, vy=y-m.y;
+        double u =(vx*ux + vy*uy) / distME;
+        if (u<=0 || u>=1) continue;
+        double px=u*distME*ux, py=u*distME*uy;
+        double perp=Math.hypot(vx-px, vy-py);
+        if (perp < DANGER_WIDTH){
+          FireCorridor fc=new FireCorridor();
+          fc.ux=ux; fc.uy=uy;
+          double sx=vx-px, sy=vy-py;
+          fc.side = (ux*sy - uy*sx)>=0 ? +1 : -1;
+          return fc;
+        }
       }
     }
-    for (IRadarResult r: radar) {
-      if (r.getObjectType()==IRadarResult.Types.Wreck){
-        double da = Math.abs(signedDiff(aimAbs, normalize(r.getObjectDirection())));
-        if (da < EPS_WRECK && r.getObjectDistance() < Math.max(0, dTarget - r.getObjectRadius() - Parameters.bulletRadius))
-          return false;
-      }
+    return null;
+  }
+  private boolean willEnterAnyMainCorridor(double nx,double ny){ return inAnyMainFireCorridor(nx,ny)!=null; }
+
+  // ===== 消息 / 广播 =====
+  private void processMessages(){
+    ArrayList<String> msgs = fetchAllMessages();
+    if (msgs!=null) for (String m: msgs){
+      try{
+        String[] p = m.split("\\|"); if (p.length<1) continue;
+        if ("POS".equals(p[0]) && p.length>=7){
+          String id=p[1]; double x=Double.parseDouble(p[3]), y=Double.parseDouble(p[4]), hdg=Double.parseDouble(p[5]);
+          AllyPos ap = ally.getOrDefault(id, new AllyPos());
+          ap.x=x; ap.y=y; ap.hdg=hdg; ap.last=tick; ap.id=id; ally.put(id, ap);
+        } else if ("TXY".equals(p[0]) && p.length>=6){
+          double x=Double.parseDouble(p[3]), y=Double.parseDouble(p[4]), rad=Double.parseDouble(p[5]);
+          EnemyXY e = new EnemyXY(); e.x=x; e.y=y; e.rad=rad; e.last=tick; enemyXY.add(e);
+        }
+      }catch(Throwable ignore){}
     }
-    return true;
+    ally.entrySet().removeIf(en -> tick - en.getValue().last > TTL_MSG);
+    enemyXY.removeIf(e -> tick - e.last > TTL_MSG);
   }
 
-  // ============== 协同（广播/接收/聚合） ==============
-  private void tryBroadcast(IRadarResult r){
-    if (!isOpponent(r.getObjectType())) return;
-    double d = r.getObjectDistance();
-    if (d <= 120 || d > MY_RANGE+1) return; // 太近/越界不播
-    int k = sectorIndex(normalize(r.getObjectDirection()));
-    if (tick - lastBroadcastForSector[k] < 8) return;
-    lastBroadcastForSector[k]=tick;
-    String msg = String.format(java.util.Locale.ROOT,
-        "TGT|%s|%d|%.6f|%.1f|%.1f", myId, tick, r.getObjectDirection(), r.getObjectDistance(), r.getObjectRadius());
+  private void tryBroadcastTXY(double dirAbs,double dist,double rad){
+    int k=sectorIndex(dirAbs);
+    if (tick - lastTxyBroadcast[k] < TXY_LIMIT) return;
+    lastTxyBroadcast[k]=tick;
+    double ex=posX + dist*Math.cos(dirAbs);
+    double ey=posY + dist*Math.sin(dirAbs);
+    String msg = String.format(java.util.Locale.ROOT, "TXY|%s|%d|%.1f|%.1f|%.1f", myId, tick, ex, ey, rad);
     broadcast(msg);
   }
 
-  private void processMessages(){
-    ArrayList<String> msgs = fetchAllMessages();
-    if (msgs==null || msgs.isEmpty()) return;
-    for (String m: msgs){
-      try{
-        String[] p = m.split("\\|");
-        if (p.length<6 || !"TGT".equals(p[0])) continue;
-        int msgTick = Integer.parseInt(p[2]);
-        if (tick - msgTick > TTL_MSG) continue;
-        double dir = Double.parseDouble(p[3]);
-        double dist= Double.parseDouble(p[4]);
-        double rad = Double.parseDouble(p[5]);
-        int k = sectorIndex(normalize(dir));
-        SharedTarget t = shared[k];
-        if (t==null){ t=new SharedTarget(); shared[k]=t; }
-        double wOld = Math.max(0, t.sources);
-        t.dir = (wOld==0)?dir : (t.dir*wOld+dir)/(wOld+1);
-        t.dist= (wOld==0)?dist: (t.dist*wOld+dist)/(wOld+1);
-        t.rad = (wOld==0)?rad : Math.max(t.rad, rad);
-        t.lastSeen = tick; t.sources=(int)(wOld+1);
-        t.trust = Math.min(1.0, t.sources/3.0);
-      }catch(Throwable ignore){}
-    }
+  // ===== 里程计 / 传感 / 工具 =====
+  private void applyOdo(){ if (Math.abs(odoPend)>1e-9){ posX += odoPend*Math.cos(odoHdg); posY += odoPend*Math.sin(odoHdg); odoPend=0.0; } }
+  private void odoMove(){ odoPend += STEP; odoHdg=getHeading(); move(); }
+
+  private IFrontSensorResult.Types frontType(){ try{ IFrontSensorResult r=detectFront(); return (r==null)?null:r.getObjectType(); }catch(Throwable t){return null;} }
+  private boolean frontIsBlock(IFrontSensorResult.Types t){
+    if (t==null) return false;
+    return t==IFrontSensorResult.Types.WALL || t==IFrontSensorResult.Types.Wreck
+        || t==IFrontSensorResult.Types.TeamMainBot || t==IFrontSensorResult.Types.TeamSecondaryBot;
   }
 
-  private SharedTarget selectBestShared(){
-    SharedTarget best=null; double bestScore=1e18;
-    for (int i=0;i<SECT;i++){
-      SharedTarget t = shared[i];
-      if (t==null) continue;
-      if (tick - t.lastSeen > TTL_MSG) { shared[i]=null; continue; }
-      double score = t.dist - 100*t.trust;
-      if (score < bestScore){ bestScore=score; best=t; }
-    }
-    return best;
-  }
-
-  // ============== 尸体扇区禁射 ==============
-  private void markCorpseAt(double angle){ corpseBanUntil[sectorIndex(angle)] = Math.max(corpseBanUntil[sectorIndex(angle)], tick + TTL_CORPSE); }
-  private boolean isCorpseSector(double angle){ return corpseBanUntil[sectorIndex(angle)] > tick; }
-  private int sectorIndex(double angle){
-    double a = normalize(angle);
-    int k = (int)Math.floor(a / TWO_PI * SECT);
-    if (k<0) k=0; if (k>=SECT) k=SECT-1; return k;
-  }
-
-  // ============== 角度工具 ==============
+  private int sectorIndex(double a){ double x=normalize(a); int k=(int)Math.floor(x/TWO_PI*SECT); if(k<0)k=0; if(k>=SECT)k=SECT-1; return k; }
   private static double normalize(double a){ a%=TWO_PI; if (a<0) a+=TWO_PI; return a; }
-  private static double signedDiff(double from, double to){
-    double d = normalize(to - from);
-    if (d> Math.PI) d -= TWO_PI;
-    if (d<=-Math.PI) d += TWO_PI;
-    return d;
-  }
-  private static double clamp(double x, double lo, double hi){ return (x<lo)?lo : (x>hi)?hi : x; }
+  private static double signedDiff(double from,double to){ double d=normalize(to-from); if(d>Math.PI)d-=TWO_PI; if(d<=-Math.PI)d+=TWO_PI; return d; }
 }
