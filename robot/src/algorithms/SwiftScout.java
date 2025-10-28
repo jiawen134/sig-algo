@@ -17,11 +17,19 @@ public class SwiftScout extends Brain {
   private static final double STEP         = Parameters.teamASecondaryBotSpeed; // 3
   private static final double BULLET_RANGE = Parameters.bulletRange;            // 1000
   private static final double DANGER_WIDTH = 90.0;                              // 主机射线廊道半宽
+  private static final double BOUNDARY_MARGIN = 100.0;                          // 边界安全距离
+  private static final double FIELD_WIDTH  = 3000.0;
+  private static final double FIELD_HEIGHT = 2000.0;
 
   private int tick=0, lastPosBroadcast=-9999;
   private final String myId = "A_SCOUT_" + Integer.toHexString((int)(Math.random()*0xFFFF));
   private final int[] lastTxyBroadcast = new int[SECT];
-  private boolean orbitRight=true;
+
+  // 巡逻状态
+  private int patrolPhase = 0;        // 巡逻阶段: 0=直行, 1=小转向
+  private int moveStraightCount = 0;  // 直行计数器
+  private int turnCount = 0;          // 转向计数器
+  private double lastTurnDir = 1.0;   // 上次转向方向（1=右，-1=左）
 
   // 里程计
   private double posX, posY, odoPend=0.0, odoHdg=0.0;
@@ -35,11 +43,15 @@ public class SwiftScout extends Brain {
 
   @Override
   public void activate() {
-    tick=0; Arrays.fill(lastTxyBroadcast, -9999); orbitRight=true;
+    tick=0; Arrays.fill(lastTxyBroadcast, -9999);
     posX = Parameters.teamASecondaryBot1InitX;
     posY = Parameters.teamASecondaryBot1InitY;
     odoPend=0.0; odoHdg=getHeading();
-    sendLogMessage("SwiftScout: scout + TXY broadcast + avoid main firing corridors.");
+    patrolPhase = 0;
+    moveStraightCount = 0;
+    turnCount = 0;
+    lastTurnDir = 1.0;
+    sendLogMessage("SwiftScout: Enhanced patrol + TXY broadcast + smart avoidance.");
   }
 
   @Override
@@ -65,34 +77,113 @@ public class SwiftScout extends Brain {
       }
     }
 
-    // 若处于任一主机→敌机射线廊道 → 横向脱离
+    // ===== 紧急避让：主机射线廊道 =====
     FireCorridor fc = inAnyMainFireCorridor(posX, posY);
     if (fc != null) {
+      // 横向脱离并继续移动
       evadeAngle = Math.atan2(fc.uy, fc.ux) + (fc.side>0 ? +Math.PI/2 : -Math.PI/2);
-      evadeTicks = 14;
+      evadeTicks = 20;  // 增加脱离时间
     }
     if (evadeTicks > 0) {
       double diff = signedDiff(getHeading(), evadeAngle);
-      if (Math.abs(diff) > 0.25) stepTurn(diff>0?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      else odoMove();
-      evadeTicks--; return;
+      if (Math.abs(diff) > 0.25) {
+        stepTurn(diff>0?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+      } else {
+        odoMove();  // 对准后立即移动
+      }
+      evadeTicks--; 
+      return;
     }
 
-    // 预测下一步是否会进入主机射线；会则先转再走
-    double nx = posX + Math.cos(getHeading())*STEP;
-    double ny = posY + Math.sin(getHeading())*STEP;
+    // ===== 边界检测与避让 =====
+    if (isNearBoundary()) {
+      handleBoundary();
+      return;
+    }
+
+    // ===== 预测下一步：避免进入主机射线 =====
+    double nx = posX + Math.cos(getHeading())*STEP*3;  // 预测3步后位置
+    double ny = posY + Math.sin(getHeading())*STEP*3;
     if (willEnterAnyMainCorridor(nx, ny)) {
-      stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      if (tick%120==0) orbitRight=!orbitRight; return;
+      // 小幅度转向，不要停止移动
+      stepTurn(lastTurnDir>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
+      odoMove();  // 转向同时移动！
+      return;
     }
 
-    // 简单避障
+    // ===== 前方障碍物检测 =====
     IFrontSensorResult.Types ft = frontType();
-    if (frontIsBlock(ft)) { stepTurn(Parameters.Direction.RIGHT); return; }
+    if (frontIsBlock(ft)) {
+      // 遇到障碍：转向并移动
+      lastTurnDir = -lastTurnDir;  // 切换方向
+      stepTurn(lastTurnDir>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
+      odoMove();
+      return;
+    }
 
-    // 2走1转扫场（覆盖全场）
-    if ((tick%3)!=0) odoMove();
-    else stepTurn(orbitRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+    // ===== 智能巡逻模式 =====
+    executePatrolStrategy();
+  }
+
+  // ===== 边界检测与处理 =====
+  private boolean isNearBoundary() {
+    return posX < BOUNDARY_MARGIN || posX > (FIELD_WIDTH - BOUNDARY_MARGIN) ||
+           posY < BOUNDARY_MARGIN || posY > (FIELD_HEIGHT - BOUNDARY_MARGIN);
+  }
+
+  private void handleBoundary() {
+    double hdg = getHeading();
+    double targetAngle = hdg;
+    
+    // 根据位置计算远离边界的方向
+    if (posX < BOUNDARY_MARGIN) {
+      // 靠近左边界 → 向右（EAST）
+      targetAngle = Parameters.EAST;
+    } else if (posX > (FIELD_WIDTH - BOUNDARY_MARGIN)) {
+      // 靠近右边界 → 向左（WEST）
+      targetAngle = Parameters.WEST;
+    } else if (posY < BOUNDARY_MARGIN) {
+      // 靠近下边界 → 向上（NORTH）
+      targetAngle = Parameters.NORTH;
+    } else if (posY > (FIELD_HEIGHT - BOUNDARY_MARGIN)) {
+      // 靠近上边界 → 向下（SOUTH）
+      targetAngle = Parameters.SOUTH;
+    }
+    
+    // 转向目标方向
+    double diff = signedDiff(hdg, targetAngle);
+    if (Math.abs(diff) > 0.15) {
+      stepTurn(diff>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
+    }
+    // 边界处理时也要移动，避免卡住
+    odoMove();
+  }
+
+  // ===== 智能巡逻策略 =====
+  private void executePatrolStrategy() {
+    if (patrolPhase == 0) {
+      // 直行阶段：移动15-25步
+      odoMove();
+      moveStraightCount++;
+      
+      if (moveStraightCount >= 20 + (tick % 10)) {  // 15-25步随机
+        patrolPhase = 1;  // 切换到转向阶段
+        moveStraightCount = 0;
+        turnCount = 0;
+      }
+    } else {
+      // 转向阶段：小幅转向2-4步
+      stepTurn(lastTurnDir>0 ? Parameters.Direction.RIGHT : Parameters.Direction.LEFT);
+      odoMove();  // 转向同时移动
+      turnCount++;
+      
+      if (turnCount >= 3) {
+        patrolPhase = 0;  // 切换回直行阶段
+        turnCount = 0;
+        // 偶尔切换方向，制造螺旋效果
+        if (tick % 100 == 0) lastTurnDir = -lastTurnDir;
+      }
+    }
   }
 
   // ===== 主机射线判定 =====
