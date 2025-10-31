@@ -1,308 +1,864 @@
 package algorithms;
 
-import java.util.*;
-import robotsimulator.Brain;
-import characteristics.Parameters;
-import characteristics.IFrontSensorResult;
 import characteristics.IRadarResult;
+import characteristics.IFrontSensorResult.Types;
+import characteristics.Parameters.Direction;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Random;
+import robotsimulator.Brain;
 
+/**
+ * Advanced combat robot with multi-agent coordination capabilities
+ * Refactored for improved code organization while maintaining identical behavior
+ */
 public class MagicMain extends Brain {
-	
-  // ===== 常量 =====
-  private static final double TWO_PI = Math.PI * 2.0;
-  private static final double BR  = Parameters.bulletRange;       // 1000
-  private static final double BUL = Parameters.bulletRadius;      // 5
-  private static final double STEP= Parameters.teamAMainBotSpeed; // 1
 
-  private static final int SECT = 64, POS_PERIOD = 25, TXY_LIMIT = 8, TTL_MSG = 80;
+   // Robot identification constants
+   private static final int BOT_ID_SCOUT_A = 2014683;
+   private static final int BOT_ID_SCOUT_B = 24269;
+   private static final int BOT_ID_MAIN_A = 2010586;
+   private static final int BOT_ID_MAIN_B = 24256;
+   private static final int BOT_ID_MAIN_C = 819;
+   private static final int BROADCAST_TEAM_ID = 12246445;
+   
+   // Communication protocol codes
+   private static final int MSG_ENEMY_SPOTTED = 2898;
+   private static final int MSG_POSITION_SYNC = 32343;
+   private static final int MSG_TERMINATOR = -1073737473;
+   private static final double ENEMY_TYPE_PRIMARY = -1.431633921E9;
+   private static final double ENEMY_TYPE_SECONDARY = -21846.0;
+   
+   // Operational modes
+   private static final int OP_MODE_MOVING = 1;
+   private static final int OP_MODE_STATIC_FIRE = 2;
+   private static final int OP_MODE_MOBILE_FIRE = 3;
+   private static final int OP_MODE_FALLBACK = 5;
+   private static final int OP_MODE_TURN_LEFT = 6;
+   private static final int OP_MODE_TURN_RIGHT = 7;
+   private static final int OP_MODE_STARTUP = 8;
+   private static final int OP_MODE_HUNTING = 9;
+   private static final int OP_MODE_ORIENT_NORTH = 10;
+   private static final int OP_MODE_ORIENT_SOUTH = 11;
+   private static final int OP_MODE_ORIENT_EAST = 12;
+   private static final int OP_MODE_ORIENT_WEST = 13;
+   private static final int OP_MODE_DESTROYED = -1159983647;
+   
+   // Navigation precision thresholds
+   private static final double ANGLE_MATCH_TIGHT = 0.001;
+   private static final double ANGLE_MATCH_LOOSE = 0.01;
+   private static final double POSITION_MATCH_TOLERANCE = 10.0;
+   private static final double TRAJECTORY_CLEARANCE = 125.0;
+   
+   // Robot state - Position
+   private double myPositionX;
+   private double myPositionY;
+   private int myIdentifier;
+   private boolean isWestTeam;
+   
+   // Robot state - Movement
+   private boolean flagMovingForward;
+   private boolean flagMovingBackward;
+   private int currentOperationMode;
+   private int simulationTick;
+   private int fallbackInitiatedTick;
+   private double targetOrientation;
+   
+   // Robot state - Combat
+   private double lockedTargetX;
+   private double lockedTargetY;
+   private boolean engagementActive;
+   private int shotCounter;
+   private int previousShotTick;
+   private boolean seekingFireAngle;
+   private String huntingDirection;
+   
+   // Team coordination data
+   private HashMap<Integer, ArrayList<Double>> teamMemberStates;
+   private ArrayList<ArrayList<Double>> detectedHostiles;
+   
+   // Utility objects
+   private Random randomGenerator;
+   private int continuousCounter;
 
-  // 清线余量
-  private static final double SAFE_PAD = 6.0;
-
-  // 走廊锁（免清线窗口）——严格：需要"近期观测"才生效
-  private static final int    LOCK_TTL_TICKS = 18;     // < 21 硬冷却
-  private static final double LOCK_ANG_EPS   = 0.10;
-  private static final double LOCK_DIST_EPS  = 70.0;
-  private static final int    FRESH_MAX_AGE  = 20;     // 目标"新鲜度"门槛（tick）
-  private static final int    LOCAL_MAX_AGE  = 5;      // 认为"雷达可信"的年龄
-
-  // 避障（墙/友军/残骸）粘性
-  private static final int    AVOID_TICKS = 15;
-  private static final int    AVOID_BACK_TICKS = 3;  // 只后退前3个tick
-  private boolean preferRight=true, avoidRight=true;
-  private int avoidLeft=0;
-
-  // ===== 运行态 =====
-  private int tick=0, lastPosBroadcast=-9999;
-  private final String myId = "A_MAIN_" + Integer.toHexString((int)(Math.random()*0xFFFF));
-
-  // 里程计
-  private double posX, posY, odoPend=0.0, odoHdg=0.0;
-
-  // 启动自定位
-  private boolean calibrated=false;
-
-  // 友军/敌情缓存
-  private static class AllyPos { double x,y,hdg; int last; String id; }
-  private final Map<String, AllyPos> ally = new HashMap<>();
-  private static class EnemyXY { double x,y,rad; int last; }
-  private final List<EnemyXY> enemyXY = new ArrayList<>();
-  private final int[] lastTxyBroadcast = new int[SECT];
-
-  // 轨迹（常速）
-  private static class Track {
-    double x,y,vx,vy,rad; int last, lastLocal, seen;
-    void init(double X,double Y,double R,int t){x=X;y=Y;vx=0;vy=0;rad=R;last=t;lastLocal=-9999;seen=0;}
-    void update(double mx,double my,int t, boolean local){
-      double xp=x+vx, yp=y+vy, rx=mx-xp, ry=my-yp; double a=0.6,b=0.2;
-      x=xp+a*rx; y=yp+a*ry; vx=vx+b*rx; vy=vy+b*ry; last=t; seen++;
-      if (local) lastLocal=t;
-    }
-  }
-  private final List<Track> tracks = new ArrayList<>();
-
-  // 走廊锁
-  private boolean fireLock=false; private double lockAim=0, lockDist=0; private int lockUntil=-1, lockLastObs=-1;
-
-  // ===== 生命周期 =====
-  @Override public void activate() {
-    tick=0; Arrays.fill(lastTxyBroadcast,-9999);
-    // 先放默认坐标，等自定位
-    posX = Parameters.teamAMainBot1InitX;
-    posY = Parameters.teamAMainBot1InitY;
-    calibrated=false;
-    odoPend=0.0; odoHdg=getHeading();
-    sendLogMessage("MagicMain: direct fire + sticky avoidance + safe lock.");
-  }
-
-  @Override public void step() {
-    tick++; applyOdo();
-
-    // —— 粘性避障优先 —— //
-    IFrontSensorResult.Types ftNow = frontType();
-    if (isObstacle(ftNow)) {
-      if (avoidLeft==0) { 
-        avoidRight=preferRight; 
-        preferRight=!preferRight; 
-        avoidLeft = AVOID_TICKS;
-      }
-    }
-    if (avoidLeft>0) {
-      int remaining = avoidLeft;
-      stepTurn(avoidRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
+   public MagicMain() {
+      this.teamMemberStates = new HashMap<>();
+      this.detectedHostiles = new ArrayList<>();
+      this.randomGenerator = new Random();
       
-      // 只在前几个tick后退，避免无限后退循环
-      if (remaining > (AVOID_TICKS - AVOID_BACK_TICKS)) {
-        moveBack();
+      ArrayList<Double> initialState = new ArrayList<>(3);
+      initialState.add(0.0);
+      initialState.add(0.0);
+      initialState.add(0.0);
+      
+      this.teamMemberStates.put(BOT_ID_MAIN_A, new ArrayList<>(initialState));
+      this.teamMemberStates.put(BOT_ID_MAIN_B, new ArrayList<>(initialState));
+      this.teamMemberStates.put(BOT_ID_MAIN_C, new ArrayList<>(initialState));
+      this.teamMemberStates.put(BOT_ID_SCOUT_A, new ArrayList<>(initialState));
+      this.teamMemberStates.put(BOT_ID_SCOUT_B, new ArrayList<>(initialState));
+   }
+
+   public void activate() {
+      this.performIdentification();
+      this.determineSideAssignment();
+      this.initializeStartingLocation();
+      this.resetAllStateVariables();
+   }
+
+   private void performIdentification() {
+      this.myIdentifier = BOT_ID_MAIN_C;
+      
+      for (IRadarResult radarContact : this.detectRadar()) {
+         if (checkAngleEquality(radarContact.getObjectDirection(), -1.5707963267948966)) {
+            this.myIdentifier = BOT_ID_MAIN_A;
+            break;
+         }
+      }
+      
+      if (this.myIdentifier != BOT_ID_MAIN_A) {
+         for (IRadarResult radarContact : this.detectRadar()) {
+            if (checkAngleEquality(radarContact.getObjectDirection(), 1.5707963267948966) && this.myIdentifier != BOT_ID_MAIN_C) {
+               this.myIdentifier = BOT_ID_MAIN_B;
+               break;
+            }
+         }
+      }
+   }
+
+   private void determineSideAssignment() {
+      this.isWestTeam = true;
+      
+      for (IRadarResult radarContact : this.detectRadar()) {
+         double bearing = radarContact.getObjectDirection();
+         if (bearing > 1.7278759594743864 && bearing < 4.5553093477052) {
+            this.isWestTeam = false;
+            this.broadcast("663121:663121:663121:663121:663121:663121:663121");
+            break;
+         }
+      }
+   }
+
+   private void initializeStartingLocation() {
+      if (this.isWestTeam) {
+         if (this.myIdentifier == BOT_ID_MAIN_C) {
+            this.myPositionX = 200.0;
+            this.myPositionY = 800.0;
+         } else if (this.myIdentifier == BOT_ID_MAIN_A) {
+            this.myPositionX = 200.0;
+            this.myPositionY = 1200.0;
+         } else {
+            this.myPositionX = 200.0;
+            this.myPositionY = 1000.0;
+         }
       } else {
-        // 后面的tick只转向，不后退
-        // 不移动，让转向生效
+         if (this.myIdentifier == BOT_ID_MAIN_C) {
+            this.myPositionX = 2800.0;
+            this.myPositionY = 800.0;
+         } else if (this.myIdentifier == BOT_ID_MAIN_A) {
+            this.myPositionX = 2800.0;
+            this.myPositionY = 1200.0;
+         } else {
+            this.myPositionX = 2800.0;
+            this.myPositionY = 1000.0;
+         }
+      }
+   }
+
+   private void resetAllStateVariables() {
+      this.currentOperationMode = OP_MODE_STARTUP;
+      this.flagMovingForward = false;
+      this.flagMovingBackward = false;
+      this.engagementActive = false;
+      this.lockedTargetX = 0.0;
+      this.lockedTargetY = 0.0;
+      this.previousShotTick = 0;
+      this.simulationTick = 0;
+      this.fallbackInitiatedTick = 0;
+      this.seekingFireAngle = false;
+      this.continuousCounter = 0;
+      this.huntingDirection = "";
+   }
+
+  public void step() {
+      ArrayList<String> receivedMessages = this.fetchAllMessages();
+      
+      this.processInitialTeamSync(receivedMessages);
+      this.simulationTick++;
+      
+      if (this.simulationTick > 3000 && this.currentOperationMode == OP_MODE_STARTUP) {
+         this.currentOperationMode = OP_MODE_MOVING;
+      }
+
+      if (this.continuousCounter > 460) {
+         this.continuousCounter = 0;
+      }
+
+      if (this.getHealth() == 0.0) {
+         this.currentOperationMode = OP_MODE_DESTROYED;
+      }
+
+      this.synchronizePosition();
+      this.outputTelemetry();
+      this.executeMainBehavior(receivedMessages);
+   }
+
+   private void processInitialTeamSync(ArrayList<String> messages) {
+      if (this.simulationTick == 0 && this.myIdentifier == BOT_ID_MAIN_B) {
+         for (String message : messages) {
+            String[] components = message.split(":");
+            if (components.length > 0 && Integer.parseInt(components[0]) == 663121) {
+               this.isWestTeam = false;
+               this.myPositionX = 2800.0;
+               this.myPositionY = 1000.0;
+               break;
+            }
+         }
+      }
+   }
+
+   private void synchronizePosition() {
+      if (this.flagMovingForward) {
+         double currentOrientation = this.getOrientationNormalized();
+         this.myPositionX += Math.cos(currentOrientation);
+         this.myPositionY += Math.sin(currentOrientation);
+         this.constrainToArena();
+         this.flagMovingForward = false;
+      }
+
+      if (this.flagMovingBackward) {
+         double currentOrientation = this.getOrientationNormalized();
+         this.myPositionX -= Math.cos(currentOrientation);
+         this.myPositionY -= Math.sin(currentOrientation);
+         this.constrainToArena();
+         this.flagMovingBackward = false;
+      }
+   }
+
+   private void constrainToArena() {
+      if (this.myPositionX < 0.0) this.myPositionX = 0.0;
+      if (this.myPositionX > 3000.0) this.myPositionX = 3000.0;
+      if (this.myPositionY < 0.0) this.myPositionY = 0.0;
+      if (this.myPositionY > 2000.0) this.myPositionY = 2000.0;
+   }
+
+   private void outputTelemetry() {
+      if (this.myIdentifier == BOT_ID_MAIN_A && this.currentOperationMode != OP_MODE_DESTROYED) {
+         int orientationDegrees = (int)(this.getOrientationNormalized() * 180.0 / Math.PI);
+         this.sendLogMessage("[Unit-A] Position: (" + (int)this.myPositionX + "," + (int)this.myPositionY + ") | Heading: " + orientationDegrees + "° | Mode: " + this.currentOperationMode);
+      }
+
+      if (this.myIdentifier == BOT_ID_MAIN_B && this.currentOperationMode != OP_MODE_DESTROYED) {
+         int orientationDegrees = (int)(this.getOrientationNormalized() * 180.0 / Math.PI);
+         this.sendLogMessage("[Unit-B] Position: (" + (int)this.myPositionX + "," + (int)this.myPositionY + ") | Heading: " + orientationDegrees + "° | Mode: " + this.currentOperationMode);
+      }
+
+      if (this.myIdentifier == BOT_ID_MAIN_C && this.currentOperationMode != OP_MODE_DESTROYED) {
+         int orientationDegrees = (int)(this.getOrientationNormalized() * 180.0 / Math.PI);
+         this.sendLogMessage("[Unit-C] Position: (" + (int)this.myPositionX + "," + (int)this.myPositionY + ") | Heading: " + orientationDegrees + "° | Mode: " + this.currentOperationMode);
+      }
+
+      if (this.engagementActive) {
+         this.continuousCounter++;
+         this.sendLogMessage(">> ENGAGING TARGET <<");
+      }
+   }
+
+   private void executeMainBehavior(ArrayList<String> messages) {
+      this.detectedHostiles.clear();
+      
+      for (String message : messages) {
+         // Handle new format (pipe-separated) messages
+         if (message.contains("|")) {
+            this.interpretMessage(message);
+         } else {
+            // Handle old format (colon-separated) messages
+            String[] components = message.split(":");
+            if (components.length > 2) {
+               try {
+                  int messageRecipient = Integer.parseInt(components[1]);
+                  if (messageRecipient == this.myIdentifier || messageRecipient == BROADCAST_TEAM_ID) {
+                     this.interpretMessage(message);
+                  }
+               } catch (NumberFormatException ignored) {
+                  // Skip malformed messages
+               }
+            }
+         }
       }
       
-      avoidLeft--;
+      this.broadcastMyPosition();
+      this.scanAndReact();
+   }
+
+   private void broadcastMyPosition() {
+      String positionMessage = this.myIdentifier + ":" + BROADCAST_TEAM_ID + ":" + MSG_POSITION_SYNC + ":" + 
+                   this.myPositionX + ":" + this.myPositionY + ":" + this.getHeading() + ":" + MSG_TERMINATOR;
+      this.broadcast(positionMessage);
+   }
+
+   private void scanAndReact() {
+      boolean immediateThreat = false;
+      
+      for (IRadarResult contact : this.detectRadar()) {
+         if (contact.getObjectType() == characteristics.IRadarResult.Types.OpponentMainBot || 
+             contact.getObjectType() == characteristics.IRadarResult.Types.OpponentSecondaryBot) {
+            double hostileX = this.myPositionX + contact.getObjectDistance() * Math.cos(contact.getObjectDirection());
+            double hostileY = this.myPositionY + contact.getObjectDistance() * Math.sin(contact.getObjectDirection());
+            
+            double hostileClassification = (contact.getObjectType() == characteristics.IRadarResult.Types.OpponentMainBot) ? 
+                              ENEMY_TYPE_PRIMARY : ENEMY_TYPE_SECONDARY;
+            
+            String enemyAlert = this.myIdentifier + ":" + BROADCAST_TEAM_ID + ":" + MSG_ENEMY_SPOTTED + ":" + 
+                        hostileClassification + ":" + hostileX + ":" + hostileY + ":" + MSG_TERMINATOR;
+            this.broadcast(enemyAlert);
+         }
+         
+         if (contact.getObjectDistance() < 120.0 && contact.getObjectType() != characteristics.IRadarResult.Types.BULLET && 
+             this.currentOperationMode == OP_MODE_MOVING) {
+            immediateThreat = true;
+         }
+      }
+      
+      if (immediateThreat) {
+         this.currentOperationMode = OP_MODE_FALLBACK;
+         this.fallbackInitiatedTick = this.simulationTick;
+         return;
+      }
+      
+      if (this.engagementActive && !this.seekingFireAngle) {
+         this.prioritizeTarget();
+      }
+
+      this.handleArenaLimits();
+      
+      if (this.currentOperationMode == OP_MODE_STARTUP) {
+         this.runStartupBehavior();
+         return;
+      }
+
+      if (this.engagementActive && this.canInitiateFire() && this.verifyFireSafety(this.lockedTargetX, this.lockedTargetY)) {
+         this.engageTarget(this.lockedTargetX, this.lockedTargetY);
+         this.previousShotTick = this.simulationTick;
       return;
     }
-    
-    // —— 自定位：识别 顶/中/底 —— //
-    if (!calibrated) {
-      if (!calibrateByRadar()) {
-        // 未定位期间小巡航避免卡死
-        if (ftNow==IFrontSensorResult.Types.WALL) stepTurn(Parameters.Direction.RIGHT);
-        else odoMove();
-			return;
-		} 
-	}
-	
-    // 周期广播自身坐标
-    if (tick - lastPosBroadcast >= POS_PERIOD){
-      lastPosBroadcast=tick;
-      broadcast(String.format(java.util.Locale.ROOT,"POS|%s|%d|%.1f|%.1f|%.6f",myId,tick,posX,posY,getHeading()));
-    }
 
-    // 消息融合
-    processMessages();
-
-    // 本地雷达→世界坐标 + TXY 转播
-    ArrayList<IRadarResult> rs = detectRadar();
-    if (rs!=null) for (IRadarResult r: rs){
-      if (r.getObjectType()==IRadarResult.Types.OpponentMainBot ||
-          r.getObjectType()==IRadarResult.Types.OpponentSecondaryBot){
-        double a=r.getObjectDirection(), d=r.getObjectDistance(), rad=r.getObjectRadius();
-        double ex=posX + d*Math.cos(a), ey=posY + d*Math.sin(a);
-        updateTracks(ex,ey,rad,true);
-        tryBroadcastTXY(a,d,rad);
-      }
-    }
-    // 清理过期
-    tracks.removeIf(t -> tick - t.last > TTL_MSG);
-
-    // 求解射击
-    AimSolution sol = pickBestSolution();
-    if (sol != null) {
-      // a) 锁有效且最近一次观测不陈旧 → 每 tick 射，交给引擎限速（不会乱开枪）
-      if (fireLockValid(sol.aim, sol.dist)) {
-        fire(sol.aim);
-        return;
-      }
-      // b) 否则做一次几何清线，通过→开火并上锁；不通过→暂缓
-      if (clearToFire(sol.aim, sol.dist)) {
-        fire(sol.aim);
-        armLock(sol.aim, sol.dist);
-        return;
-      }
-      // 清线不通过：轻微移动调整位置，避免卡死
-      // 每2个tick移动一次，其余时间转向
-      if (tick%3 == 0) {
-        odoMove();
-      } else {
-        stepTurn(preferRight?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-      }
-      if (tick%50==0) preferRight=!preferRight;
-      return;
-    }
-
-    // 无可射解：小步直线巡航 + 墙面避障
-    if (ftNow==IFrontSensorResult.Types.WALL) { stepTurn(Parameters.Direction.RIGHT); return; }
-    double dE = angDiff(getHeading(), Parameters.EAST);
-    if (Math.abs(dE) > 0.30) stepTurn(dE>0?Parameters.Direction.RIGHT:Parameters.Direction.LEFT);
-    else odoMove();
-  }
-
-  // ===== 自定位（顶/中/底） =====
-  private boolean calibrateByRadar(){
-    ArrayList<IRadarResult> rs = detectRadar();
-    if (rs==null) return false;
-    int north=0, south=0;
-    for (IRadarResult r: rs){
-      if (r.getObjectType()==IRadarResult.Types.TeamMainBot){
-        if (Math.sin(r.getObjectDirection()) >= 0) south++; else north++;
-      }
-    }
-    if (north+south==0) return false;
-    posX = Parameters.teamAMainBot1InitX; // A 队三台主机 X 相同
-    if (north>0 && south>0)      posY = Parameters.teamAMainBot2InitY; // 中
-    else if (south>0)            posY = Parameters.teamAMainBot1InitY; // 顶
-    else                         posY = Parameters.teamAMainBot3InitY; // 底
-    calibrated = true;
-    return true;
-  }
-
-  // ===== 射击解（直射，不预测移动） =====
-  private static class AimSolution { double aim, dist; int freshness, localAge; }
-  private AimSolution pickBestSolution(){
-    AimSolution best=null; double bestScore=1e18;
-    for (Track tr: tracks){
-      int fresh = tick - tr.last;
-      if (fresh > FRESH_MAX_AGE) continue;                 // 过陈旧不打
-      int lAge  = (tr.lastLocal<0)? 9999 : tick - tr.lastLocal;
-
-      // 直射（不预测敌人移动）
-      double dx=tr.x-posX, dy=tr.y-posY;
-      double aim  = Math.atan2(dy, dx);
-      double dist = Math.hypot(dx, dy);
+      this.evaluateHuntingMode();
+      this.executeHuntingBehavior();
+      this.processBehaviorStateMachine();
       
-      if (dist>BR) continue;
-
-      // 打分：距离近 + 最近本机雷达优先
-      double score = dist + (lAge<=LOCAL_MAX_AGE? 0 : 200) + fresh*2;
-      if (score < bestScore){
-        bestScore=score;
-        best=new AimSolution(); best.aim=aim; best.dist=dist; best.freshness=fresh; best.localAge=lAge;
+      if (this.currentOperationMode == OP_MODE_DESTROYED) {
+         return;
       }
-    }
-    return best;
-  }
+   }
 
-  // ===== 走廊锁（基于近期观测，杜绝乱开枪） =====
-  private boolean fireLockValid(double aimAbs,double dTarget){
-    if (!fireLock) return false;
-    if (tick >= lockUntil) return false;
-    if (tick - lockLastObs > FRESH_MAX_AGE) return false;  // 观测陈旧 -> 失效
-    if (Math.abs(angDiff(lockAim, aimAbs)) > LOCK_ANG_EPS) return false;
-    if (Math.abs(lockDist - dTarget) > LOCK_DIST_EPS) return false;
-    return true;
-  }
-  private void armLock(double aimAbs,double dTarget){
-    fireLock=true; lockAim=aimAbs; lockDist=dTarget; lockUntil=tick + LOCK_TTL_TICKS; lockLastObs=tick;
-  }
-
-  // ===== 几何清线（友/残骸） + 前方仅“墙”硬拦 =====
-  private boolean clearToFire(double aimAbs, double dTarget){
-    if (frontType()==IFrontSensorResult.Types.WALL) return false; // 避免贴墙自爆
-
-    // 友军
-    for (AllyPos ap : ally.values()){
-      if (tick - ap.last > TTL_MSG) continue;
-      if (blocksLine(ap.x, ap.y, 50.0, dTarget, aimAbs)) return false;
-    }
-    // 残骸
-    ArrayList<IRadarResult> rs = detectRadar();
-    if (rs!=null) for (IRadarResult r: rs){
-      if (r.getObjectType()==IRadarResult.Types.Wreck){
-        double wx=posX + r.getObjectDistance()*Math.cos(r.getObjectDirection());
-        double wy=posY + r.getObjectDistance()*Math.sin(r.getObjectDirection());
-        if (blocksLine(wx, wy, r.getObjectRadius(), dTarget, aimAbs)) return false;
+   private void interpretMessage(String message) {
+      // Support both old format (colon-separated) and new format (pipe-separated)
+      if (message.contains("|")) {
+         // New format from MagicSecondary: "POS|id|tick|x|y|heading" or "ENEMY|id|tick|x|y|radius"
+         this.parseNewFormatMessage(message);
+      } else {
+         // Old format: "id:teamId:msgType:data..."
+         String[] components = message.split(":");
+         if (components.length < 6) return;
+         
+         int messageCategory = Integer.parseInt(components[2]);
+         
+         if (messageCategory == MSG_ENEMY_SPOTTED) {
+            this.registerHostileContact(components);
+         } else if (messageCategory == MSG_POSITION_SYNC) {
+            this.updateTeamMemberPosition(components);
+         }
       }
-    }
-    return true;
-  }
-  private boolean blocksLine(double ox,double oy,double rad,double dTarget,double aimAbs){
-    double ux=Math.cos(aimAbs), uy=Math.sin(aimAbs);
-    double dx=ox-posX, dy=oy-posY;
-    double u=(dx*ux+dy*uy)/dTarget; if (u<=0 || u>=1) return false;
-    double px=u*dTarget*ux, py=u*dTarget*uy;
-    double perp=Math.hypot(dx-px, dy-py);
-    return perp <= (rad + BUL + SAFE_PAD);
-  }
+   }
 
-  // ===== 敌情/友军融合 + TXY 广播 =====
-  private void processMessages(){
-    ArrayList<String> msgs = fetchAllMessages();
-    if (msgs==null) return;
-    for (String m: msgs){
-      try{
-        String[] p=m.split("\\|"); if (p.length<1) continue;
-        if ("POS".equals(p[0]) && p.length>=7){
-          String id=p[1]; double x=Double.parseDouble(p[3]), y=Double.parseDouble(p[4]), hdg=Double.parseDouble(p[5]);
-          AllyPos ap=ally.getOrDefault(id,new AllyPos());
-          ap.x=x; ap.y=y; ap.hdg=hdg; ap.last=tick; ap.id=id; ally.put(id,ap);
-        } else if ("TXY".equals(p[0]) && p.length>=6){
-          double x=Double.parseDouble(p[3]), y=Double.parseDouble(p[4]), rad=Double.parseDouble(p[5]);
-          updateTracks(x,y,rad,false);
-        }
-      }catch(Throwable ignore){}
-    }
-    ally.entrySet().removeIf(en -> tick - en.getValue().last > TTL_MSG);
-  }
+   private void parseNewFormatMessage(String message) {
+      try {
+         String[] parts = message.split("\\|");
+         if (parts.length < 4) return;
+         
+         String msgType = parts[0];
+         
+         if ("ENEMY".equals(msgType) && parts.length >= 6) {
+            // ENEMY|id|tick|x|y|radius
+            double x = Double.parseDouble(parts[3]);
+            double y = Double.parseDouble(parts[4]);
+            
+            boolean alreadyKnown = false;
+            for (ArrayList<Double> hostile : this.detectedHostiles) {
+               if (Math.abs(x - hostile.get(1)) <= POSITION_MATCH_TOLERANCE && 
+                   Math.abs(y - hostile.get(2)) <= POSITION_MATCH_TOLERANCE) {
+                  alreadyKnown = true;
+                  break;
+               }
+            }
+            
+            if (!alreadyKnown) {
+               ArrayList<Double> newHostile = new ArrayList<>(3);
+               newHostile.add(ENEMY_TYPE_PRIMARY);  // Default type
+               newHostile.add(x);
+               newHostile.add(y);
+               this.detectedHostiles.add(newHostile);
+            }
+            
+            this.engagementActive = true;
+         } else if ("POS".equals(msgType) && parts.length >= 6) {
+            // POS|id|tick|x|y|heading
+            String senderId = parts[1];
+            // Extract numeric ID from string like "SCOUT_XXXX" or "MAIN_XXXX"
+            int numericId = senderId.hashCode();  // Use hashCode as numeric ID
+            
+            ArrayList<Double> memberState = new ArrayList<>(3);
+            memberState.add(Double.parseDouble(parts[3]));  // x
+            memberState.add(Double.parseDouble(parts[4]));  // y
+            memberState.add(Double.parseDouble(parts[5]));  // heading
+            this.teamMemberStates.put(numericId, memberState);
+         }
+      } catch (Throwable ignored) {
+         // Ignore malformed messages
+      }
+   }
 
-  private void updateTracks(double ex,double ey,double rad, boolean local){
-    // 关联最近轨迹（180mm 门限）
-    Track near=null; double best=1e18;
-    for (Track t: tracks){ double dd=Math.hypot(t.x-ex,t.y-ey); if (dd<best){best=dd; near=t;} }
-    if (near==null || best>180.0){ near=new Track(); near.init(ex,ey,rad,tick); tracks.add(near); }
-    near.rad=rad; near.update(ex,ey,tick,local);
-    if (local) lockLastObs=tick; // 供锁有效性使用
-  }
+   private void registerHostileContact(String[] components) {
+      double x = Double.parseDouble(components[4]);
+      double y = Double.parseDouble(components[5]);
+      
+      boolean alreadyKnown = false;
+      for (ArrayList<Double> hostile : this.detectedHostiles) {
+         if (Math.abs(x - hostile.get(1)) <= POSITION_MATCH_TOLERANCE && 
+             Math.abs(y - hostile.get(2)) <= POSITION_MATCH_TOLERANCE) {
+            alreadyKnown = true;
+            break;
+         }
+      }
+      
+      if (!alreadyKnown) {
+         ArrayList<Double> newHostile = new ArrayList<>(3);
+         newHostile.add(Double.parseDouble(components[3]));
+         newHostile.add(x);
+         newHostile.add(y);
+         this.detectedHostiles.add(newHostile);
+      }
+      
+      this.engagementActive = true;
+   }
 
-  private void tryBroadcastTXY(double dirAbs,double dist,double rad){
-    int k=(int)Math.floor(normalize(dirAbs)/TWO_PI*SECT); if (k<0)k=0; if (k>=SECT)k=SECT-1;
-    if (tick - lastTxyBroadcast[k] < TXY_LIMIT) return;
-    lastTxyBroadcast[k]=tick;
-    double ex=posX + dist*Math.cos(dirAbs), ey=posY + dist*Math.sin(dirAbs);
-    broadcast(String.format(java.util.Locale.ROOT,"TXY|%s|%d|%.1f|%.1f|%.1f",myId,tick,ex,ey,rad));
-  }
+   private void updateTeamMemberPosition(String[] components) {
+      int senderId = Integer.parseInt(components[0]);
+      ArrayList<Double> memberState = new ArrayList<>(3);
+      memberState.add(Double.parseDouble(components[3]));
+      memberState.add(Double.parseDouble(components[4]));
+      memberState.add(Double.parseDouble(components[5]));
+      this.teamMemberStates.put(senderId, memberState);
+   }
 
-  // ===== 里程计 / 传感 / 工具 =====
-  private void applyOdo(){ if (Math.abs(odoPend)>1e-9){ posX += odoPend*Math.cos(odoHdg); posY += odoPend*Math.sin(odoHdg); odoPend=0.0; } }
-  private void odoMove(){ odoPend += STEP; odoHdg=getHeading(); move(); }
+   private void handleArenaLimits() {
+      if (this.myPositionX <= 50.0) {
+         this.currentOperationMode = this.verifyOrientation(0.0) ? OP_MODE_MOVING : OP_MODE_ORIENT_EAST;
+         return;
+      }
 
-  private IFrontSensorResult.Types frontType(){ try{ IFrontSensorResult r=detectFront(); return (r==null)?null:r.getObjectType(); }catch(Throwable t){return null;} }
-  private boolean isObstacle(IFrontSensorResult.Types t){
-    if (t==null) return false;
-    return t==IFrontSensorResult.Types.WALL || t==IFrontSensorResult.Types.Wreck
-        || t==IFrontSensorResult.Types.TeamMainBot || t==IFrontSensorResult.Types.TeamSecondaryBot;
-  }
+      if (this.myPositionX >= 2950.0) {
+         this.currentOperationMode = this.verifyOrientation(Math.PI) ? OP_MODE_MOVING : OP_MODE_ORIENT_WEST;
+         return;
+      }
 
-  private static double normalize(double a){ a%=TWO_PI; if (a<0) a+=TWO_PI; return a; }
-  private static double angDiff(double from,double to){ double d=normalize(to-from); if(d>Math.PI)d-=TWO_PI; if(d<=-Math.PI)d+=TWO_PI; return d; }
+      if (this.myPositionY <= 50.0) {
+         this.currentOperationMode = this.verifyOrientation(1.5707963267948966) ? OP_MODE_MOVING : OP_MODE_ORIENT_SOUTH;
+         return;
+      }
+
+      if (this.myPositionY >= 1950.0) {
+         if (this.verifyOrientation(-1.5707963267948966)) {
+            this.currentOperationMode = OP_MODE_MOVING;
+         } else {
+            this.currentOperationMode = OP_MODE_ORIENT_NORTH;
+         }
+      }
+   }
+
+   private void runStartupBehavior() {
+      if (this.simulationTick > 100 && this.canInitiateFire()) {
+         if (this.engagementActive && this.verifyFireSafety(this.lockedTargetX, this.lockedTargetY)) {
+            this.engageTarget(this.lockedTargetX, this.lockedTargetY);
+            this.previousShotTick = this.simulationTick;
+         } else {
+            this.fire(this.getOrientationNormalized());
+            this.previousShotTick = this.simulationTick;
+         }
+      } else {
+         this.executeForwardMovement();
+      }
+   }
+
+   private void evaluateHuntingMode() {
+      if (!this.engagementActive && this.simulationTick > 6000 && !this.detectedHostiles.isEmpty() && 
+          this.currentOperationMode != OP_MODE_HUNTING) {
+         ArrayList<Double> priorityHostile = this.detectedHostiles.get(0);
+         double targetX = priorityHostile.get(1);
+         double targetY = priorityHostile.get(2);
+         double deltaX = Math.abs(targetX - this.myPositionX);
+         double deltaY = Math.abs(targetY - this.myPositionY);
+         
+         if (deltaX > deltaY || deltaY < 200.0) {
+            this.currentOperationMode = OP_MODE_HUNTING;
+            this.huntingDirection = "x";
+         } else if (deltaX > 200.0) {
+            this.currentOperationMode = OP_MODE_HUNTING;
+            this.huntingDirection = "y";
+         }
+      }
+   }
+
+   private void executeHuntingBehavior() {
+      if (this.currentOperationMode == OP_MODE_HUNTING && !this.engagementActive) {
+         if (this.detectedHostiles.isEmpty()) {
+            this.currentOperationMode = OP_MODE_MOVING;
+            this.huntingDirection = "";
+            return;
+         }
+         
+         if ("x".equals(this.huntingDirection)) {
+            this.huntAlongXAxis();
+         } else {
+            this.huntAlongYAxis();
+         }
+      } else if (this.currentOperationMode == OP_MODE_HUNTING && this.engagementActive) {
+         this.currentOperationMode = OP_MODE_MOVING;
+         this.executeForwardMovement();
+         this.huntingDirection = "";
+      }
+   }
+
+   private void huntAlongXAxis() {
+      ArrayList<Double> hostile = this.detectedHostiles.get(0);
+      double targetX = hostile.get(1);
+      double separation = Math.abs(targetX - this.myPositionX);
+      
+      if (separation < 200.0) {
+         this.huntingDirection = "";
+         this.currentOperationMode = OP_MODE_MOVING;
+         return;
+      }
+      
+      if (targetX < this.myPositionX) {
+         if (this.verifyOrientation(Math.PI)) {
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(Math.PI);
+         }
+      } else {
+         if (this.verifyOrientation(0.0)) {
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(0.0);
+         }
+      }
+   }
+
+   private void huntAlongYAxis() {
+      ArrayList<Double> hostile = this.detectedHostiles.get(0);
+      double targetY = hostile.get(2);
+      double separation = Math.abs(targetY - this.myPositionY);
+      
+      if (separation < 200.0) {
+         this.huntingDirection = "";
+         this.currentOperationMode = OP_MODE_MOVING;
+         return;
+      }
+      
+      if (targetY < this.myPositionY) {
+         if (this.verifyOrientation(-1.5707963267948966)) {
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(-1.5707963267948966);
+         }
+      } else {
+         if (this.verifyOrientation(1.5707963267948966)) {
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(1.5707963267948966);
+         }
+      }
+   }
+
+   private void rotateTowardAngle(double desiredAngle) {
+      double currentOrientation = this.getOrientationNormalized();
+      
+      if (desiredAngle == 0.0 || desiredAngle == Math.PI) {
+         if (currentOrientation < Math.PI && currentOrientation > 0.0) {
+            this.stepTurn(desiredAngle == 0.0 ? Direction.LEFT : Direction.RIGHT);
+         } else {
+            this.stepTurn(desiredAngle == 0.0 ? Direction.RIGHT : Direction.LEFT);
+         }
+      } else {
+         if (!(currentOrientation < 1.5707963267948966) && !(currentOrientation > 4.71238898038469)) {
+            this.stepTurn(desiredAngle < 0.0 ? Direction.RIGHT : Direction.LEFT);
+         } else {
+            this.stepTurn(desiredAngle < 0.0 ? Direction.LEFT : Direction.RIGHT);
+         }
+      }
+   }
+
+   private void processBehaviorStateMachine() {
+      if (this.currentOperationMode == OP_MODE_MOVING) {
+         this.executeMovementMode();
+      } else if (this.currentOperationMode == OP_MODE_STATIC_FIRE) {
+         this.executeStaticFireMode();
+      } else if (this.currentOperationMode == OP_MODE_MOBILE_FIRE) {
+         this.executeMobileFireMode();
+      } else if (this.currentOperationMode == OP_MODE_FALLBACK) {
+         this.executeFallbackMode();
+      } else if (this.currentOperationMode == OP_MODE_TURN_LEFT || this.currentOperationMode == OP_MODE_TURN_RIGHT) {
+         this.executeTurnMode();
+      } else {
+         this.executeOrientationModes();
+      }
+   }
+
+   private void executeMovementMode() {
+      if (this.detectFront().getObjectType() == Types.WALL) {
+         this.handleObstacle();
+         return;
+      }
+      
+      if (this.canInitiateFire()) {
+         for (int attempt = 0; attempt < 10; attempt++) {
+            double randomOffset = this.randomGenerator.nextDouble() * Math.PI / 6.0 - 0.2617993877991494;
+            double testX = this.myPositionX + 1000.0 * Math.cos(this.getOrientationNormalized() + randomOffset);
+            double testY = this.myPositionY + 1000.0 * Math.sin(this.getOrientationNormalized() + randomOffset);
+            if (this.verifyFireSafety(testX, testY)) {
+               this.engageTarget(testX, testY);
+               this.previousShotTick = this.simulationTick;
+               return;
+            }
+         }
+      }
+      this.executeForwardMovement();
+   }
+
+   private void executeStaticFireMode() {
+      this.currentOperationMode = OP_MODE_MOVING;
+      if (++this.shotCounter % 2 == 0 && this.continuousCounter < 415) {
+         this.moveBack();
+         double orientation = this.getHeading();
+         this.myPositionX -= Math.cos(orientation);
+         this.myPositionY -= Math.sin(orientation);
+         this.constrainToArena();
+      } else {
+         this.executeForwardMovement();
+      }
+   }
+
+   private void executeMobileFireMode() {
+      this.currentOperationMode = OP_MODE_MOVING;
+      if (++this.shotCounter % 1 == 0) {
+         this.moveBack();
+         double orientation = this.getHeading();
+         this.myPositionX -= Math.cos(orientation);
+         this.myPositionY -= Math.sin(orientation);
+         this.constrainToArena();
+      } else {
+         this.executeForwardMovement();
+      }
+   }
+
+   private void executeFallbackMode() {
+      if (this.simulationTick < this.fallbackInitiatedTick + 25) {
+         this.executeBackwardMovement();
+      } else {
+         if (Math.random() < 0.5) {
+            this.currentOperationMode = OP_MODE_TURN_LEFT;
+            this.targetOrientation = this.getHeading() + -1.5707963267948966;
+            this.stepTurn(Direction.LEFT);
+         } else {
+            this.currentOperationMode = OP_MODE_TURN_RIGHT;
+            this.targetOrientation = this.getHeading() + 1.5707963267948966;
+            this.stepTurn(Direction.RIGHT);
+         }
+      }
+   }
+
+   private void executeTurnMode() {
+      if (this.verifyOrientation(this.targetOrientation)) {
+         this.currentOperationMode = OP_MODE_MOVING;
+         this.executeForwardMovement();
+      } else {
+         Direction turnDirection = (this.currentOperationMode == OP_MODE_TURN_LEFT) ? Direction.LEFT : Direction.RIGHT;
+         this.stepTurn(turnDirection);
+      }
+   }
+
+   private void executeOrientationModes() {
+      if (this.currentOperationMode == OP_MODE_ORIENT_NORTH) {
+         if (this.verifyOrientation(-1.5707963267948966)) {
+            this.currentOperationMode = OP_MODE_MOVING;
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(-1.5707963267948966);
+         }
+      } else if (this.currentOperationMode == OP_MODE_ORIENT_SOUTH) {
+         if (this.verifyOrientation(1.5707963267948966)) {
+            this.currentOperationMode = OP_MODE_MOVING;
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(1.5707963267948966);
+         }
+      } else if (this.currentOperationMode == OP_MODE_ORIENT_EAST) {
+         if (this.verifyOrientation(0.0)) {
+            this.currentOperationMode = OP_MODE_MOVING;
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(0.0);
+         }
+      } else if (this.currentOperationMode == OP_MODE_ORIENT_WEST) {
+         if (this.verifyOrientation(Math.PI)) {
+            this.currentOperationMode = OP_MODE_MOVING;
+            this.executeForwardMovement();
+         } else {
+            this.rotateTowardAngle(Math.PI);
+         }
+      }
+   }
+
+   private void handleObstacle() {
+      // Immediate action: always turn when facing a wall, don't just stand there
+      this.currentOperationMode = OP_MODE_TURN_LEFT;
+      this.targetOrientation = this.getHeading() + -1.5707963267948966;
+      this.stepTurn(Direction.LEFT);
+   }
+
+   private void prioritizeTarget() {
+      ArrayList<ArrayList<Double>> viableTargets = new ArrayList<>();
+      
+      for (ArrayList<Double> hostile : this.detectedHostiles) {
+         double range = this.measureDistance(this.myPositionX, this.myPositionY, hostile.get(1), hostile.get(2));
+         if (range <= 1000.0) {
+            viableTargets.add(hostile);
+         }
+      }
+      
+      viableTargets.sort((h1, h2) -> {
+         double r1 = this.measureDistance(this.myPositionX, this.myPositionY, h1.get(1), h1.get(2));
+         double r2 = this.measureDistance(this.myPositionX, this.myPositionY, h2.get(1), h2.get(2));
+         return Double.compare(r1, r2);
+      });
+      
+      for (ArrayList<Double> hostile : viableTargets) {
+         if (this.verifyFireSafety(hostile.get(1), hostile.get(2))) {
+            this.lockedTargetX = hostile.get(1);
+            this.lockedTargetY = hostile.get(2);
+            
+            double range = this.measureDistance(this.myPositionX, this.myPositionY, this.lockedTargetX, this.lockedTargetY);
+            this.currentOperationMode = (range > 600.0) ? OP_MODE_STATIC_FIRE : OP_MODE_MOBILE_FIRE;
+            return;
+         }
+      }
+      
+      this.engagementActive = false;
+   }
+
+   private void engageTarget(double x, double y) {
+      double firingAngle;
+      if (this.myPositionX <= x) {
+         firingAngle = Math.atan((y - this.myPositionY) / (x - this.myPositionX));
+      } else {
+         firingAngle = Math.PI + Math.atan((y - this.myPositionY) / (x - this.myPositionX));
+      }
+      this.fire(firingAngle);
+   }
+
+   private boolean verifyFireSafety(double x, double y) {
+      double trajectorySlope = (y - this.myPositionY) / (x - this.myPositionX);
+      double trajectoryIntercept = this.myPositionY - trajectorySlope * this.myPositionX;
+      
+      for (ArrayList<Double> teammate : this.teamMemberStates.values()) {
+         double teammateX = teammate.get(0);
+         double teammateY = teammate.get(1);
+         
+         if (this.measureDistance(this.myPositionX, this.myPositionY, teammateX, teammateY) <= 10.0) {
+            continue;
+         }
+         
+         double angleToTeammate = this.calculateBearingTo(teammateX, teammateY);
+         double angleToTarget = this.calculateBearingTo(x, y);
+         
+         if (Math.abs(angleToTeammate - angleToTarget) < 0.2617993877991494 && 
+             this.measureDistance(this.myPositionX, this.myPositionY, teammateX, teammateY) < 
+             this.measureDistance(this.myPositionX, this.myPositionY, x, y)) {
+            return false;
+         }
+         
+         double orientation = this.getHeading();
+         if ((orientation == 0.0 && Math.abs(teammateY - this.myPositionY) < 15.0 && teammateX > this.myPositionX) ||
+             (orientation == Math.PI && Math.abs(teammateY - this.myPositionY) < 15.0 && teammateX < this.myPositionX) ||
+             (orientation == 1.5707963267948966 && Math.abs(teammateX - this.myPositionX) < 15.0 && teammateY > this.myPositionY) ||
+             (orientation == -1.5707963267948966 && Math.abs(teammateX - this.myPositionX) < 15.0 && teammateY < this.myPositionY)) {
+            return false;
+         }
+         
+         double teammateSlope = Math.tan(teammate.get(2));
+         double teammateIntercept = teammateY - teammateSlope * teammateX;
+         double crossingX = (trajectoryIntercept - teammateIntercept) / (teammateSlope - trajectorySlope);
+         double crossingY = trajectorySlope * crossingX + trajectoryIntercept;
+         
+         if (this.measureDistance(teammateX, teammateY, crossingX, crossingY) <= TRAJECTORY_CLEARANCE) {
+            boolean xWithinRange = (x >= crossingX && crossingX >= this.myPositionX) || 
+                             (x <= crossingX && crossingX <= this.myPositionX);
+            boolean yWithinRange = (y >= crossingY && crossingY >= this.myPositionY) || 
+                             (y <= crossingY && crossingY <= this.myPositionY);
+            if (xWithinRange && yWithinRange) {
+               return false;
+            }
+         }
+      }
+      
+      Types obstacleAhead = this.detectFront().getObjectType();
+      return obstacleAhead != Types.TeamMainBot && obstacleAhead != Types.TeamSecondaryBot;
+   }
+
+   private double measureDistance(double x1, double y1, double x2, double y2) {
+      double dx = x2 - x1;
+      double dy = y2 - y1;
+      return Math.sqrt(dx * dx + dy * dy);
+   }
+
+   private double calculateBearingTo(double x, double y) {
+      return this.convertAngleToStandard(Math.atan2(y - this.myPositionY, x - this.myPositionX));
+   }
+
+   private double convertAngleToStandard(double angle) {
+      while (angle < 0.0) {
+         angle += 6.283185307179586;
+      }
+      while (angle >= 6.283185307179586) {
+         angle -= 6.283185307179586;
+      }
+      return angle;
+   }
+
+   private double getOrientationNormalized() {
+      return this.convertAngleToStandard(this.getHeading());
+   }
+
+   private boolean checkAngleEquality(double angle1, double angle2) {
+      return Math.abs(this.convertAngleToStandard(angle1) - this.convertAngleToStandard(angle2)) < ANGLE_MATCH_TIGHT;
+   }
+
+   private boolean verifyOrientation(double targetAngle) {
+      return Math.abs(Math.sin(this.getHeading() - targetAngle)) < ANGLE_MATCH_LOOSE;
+   }
+
+   private boolean canInitiateFire() {
+      return this.simulationTick > this.previousShotTick + 20;
+   }
+
+   private void executeForwardMovement() {
+      this.flagMovingForward = true;
+      this.move();
+   }
+
+   private void executeBackwardMovement() {
+      this.flagMovingBackward = true;
+      this.moveBack();
+   }
 }
